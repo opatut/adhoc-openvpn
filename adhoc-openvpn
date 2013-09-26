@@ -1,0 +1,393 @@
+#!/usr/bin/env python
+import sys, argparse, socket, struct, random, string, os, shutil
+import subprocess, zipfile, io, threading
+from socketserver import *
+
+DEFAULT_PORT = 23944
+BUFFER_SIZE = 1024
+
+OPENVPN_CLIENT_CONFIG="""# Generated config, don't edit
+client
+;dev tap
+dev tun
+;proto tcp
+proto udp
+remote {host} 1194
+resolv-retry infinite
+nobind
+user nobody
+group nobody
+persist-key
+persist-tun
+ca {host_config_dir}/ca.crt
+cert {host_config_dir}/client.crt
+key {host_config_dir}/client.key
+ns-cert-type server
+tls-auth {host_config_dir}/ta.key 1
+comp-lzo
+verb 3
+"""
+
+OPENVPN_SERVER_CONFIG="""# Generated config, don't edit
+;proto tcp
+proto udp
+;dev tap
+dev tun
+ca {config_path}/ca.crt
+cert {config_path}/server.crt
+key {config_path}/server.key
+dh {config_path}/dh1024.pem
+server 10.55.55.0 255.255.255.0
+ifconfig-pool-persist {config_path}/ipp.txt
+client-to-client
+tls-auth {config_path}/ta.key 0
+comp-lzo
+user nobody
+group nobody
+persist-key
+persist-tun
+status {config_path}/status.log
+verb 3
+"""
+
+def read_file(path):
+    with open(path, "rb") as f:
+        data = b""
+        while True:
+            byte = f.read(1)
+            if not byte: break
+            data += byte
+        return data
+
+class Generator(object):
+    def __init__(self, dir):
+        self.dir = dir
+
+    @property
+    def easy_rsa_dir(self):
+        return os.path.join(self.dir, "easy-rsa")
+
+    def get_key_dir(self, key_name, server):
+        if server: return os.path.join(self.dir, "server")
+        return os.path.join(self.dir, "clients", key_name)
+
+    def get_ta_path(self, key_name, server):
+        return os.path.join(self.get_key_dir(key_name, server), "ta.key")
+
+    def prepare_easy_rsa(self):
+        if os.path.exists(self.easy_rsa_dir): return
+        shutil.copytree("/usr/share/openvpn/easy-rsa/", self.easy_rsa_dir)
+
+    def generate_environment(self, key_name, server):
+        env = {}
+        env[b"EASY_RSA"]             = self.easy_rsa_dir
+        env[b"OPENSSL"]              = "openssl"
+        env[b"PKCS11TOOL"]           = "pkcs11-tool"
+        env[b"GREP"]                 = "grep"
+        env[b"KEY_CONFIG"]           = "{cwd}/openssl-1.0.0.cnf".format(cwd=self.easy_rsa_dir)
+        env[b"KEY_DIR"]              = self.get_key_dir(key_name, server)
+        env[b"KEY_SIZE"]             = 1024
+        env[b"CA_EXPIRE"]            = 1 # days
+        env[b"KEY_EXPIRE"]           = 1 # days
+        env[b"KEY_COUNTRY"]          = "US"
+        env[b"KEY_PROVINCE"]         = "CA"
+        env[b"KEY_CITY"]             = "No City"
+        env[b"KEY_ORG"]              = "No Org"
+        env[b"KEY_EMAIL"]            = "invalid@example.com"
+        env[b"KEY_CN"]               = key_name
+        env[b"KEY_NAME"]             = "No-Name"
+        env[b"KEY_OU"]               = ""
+        env[b"PKCS11_MODULE_PATH"]   = "changeme"
+        env[b"PKCS11_PIN"]           = "1234"
+        return {k:str(v).encode("ascii") for k,v in env.items()}
+
+    def easyrsa(self, cmd, msg, env, input=""):
+        global t
+        t = None
+        def dottimer():
+            print(".", end="")
+            sys.stdout.flush()
+            global t
+            t = threading.Timer(0.5, dottimer)
+            t.start()
+        print("[generate] " + msg + "..", end="")
+        dottimer()
+
+        p = subprocess.Popen(cmd.split(), stdin=subprocess.PIPE,
+            stdout=subprocess.DEVNULL,
+            #stderr=subprocess.DEVNULL,
+            cwd=self.easy_rsa_dir, env=env)
+        p.communicate(input.encode("ascii"))
+
+        if p.wait() != 0:
+            t.cancel()
+            print(" failed!")
+            sys.exit(1)
+        t.cancel()
+        print(" done.")
+
+
+    def generate(self, server=False):
+        if server:
+            key_name = "adhoc-openvpn"
+        else:
+            while True:
+                key_name = "".join(random.choice(string.ascii_letters + string.digits) for x in range(8))
+                if not os.path.exists(self.get_key_dir(key_name, False)): break
+
+        # copy easyrsa files
+        self.prepare_easy_rsa()
+
+        # prepare environment
+        env = self.generate_environment(key_name, server)
+
+        # create key directory
+        directory = self.get_key_dir(key_name, server)
+        if not os.path.exists(directory):
+            os.makedirs(directory)
+
+        # prepare key directory
+        self.easyrsa("./clean-all", "Prepare key generation", env)
+
+        # copy ca.crt and ca.key to key directory
+        if not server:
+            server_directory = self.get_key_dir("", True)
+            shutil.copy(os.path.join(server_directory, "ca.crt"), directory)
+            shutil.copy(os.path.join(server_directory, "ca.key"), directory)
+            shutil.copy(os.path.join(server_directory, "ta.key"), directory)
+
+        # build the key
+        if server:
+            self.easyrsa("./pkitool --initca",        "Creating CA", env)
+            self.easyrsa("./build-dh",                "Building Diffie-Hellman Parameters", env)
+            self.easyrsa("./pkitool --server server", "Creating server key", env)
+            self.easyrsa("openvpn --genkey --secret {ta}".format(ta=self.get_ta_path("server", True)),
+                                                      "Generating handshake token", env)
+        else:
+            self.easyrsa("./pkitool client",          "Creating client key", env)
+
+        # remove ca.key (server private key) from client key directory
+        if not server: os.remove(os.path.join(directory, "ca.key"))
+
+        # clean the directory
+        os.remove(os.path.join(directory, "index.txt"))
+        os.remove(os.path.join(directory, "serial"))
+
+        return key_name
+
+    def create_zip(self, key_name):
+        cwd = self.get_key_dir(key_name, False)
+        path = os.path.join(self.dir, "clients", key_name+".zip")
+
+        archive = zipfile.ZipFile(path, "w")
+        archive.write(os.path.join(cwd, "ca.crt"), "./ca.crt")
+        archive.write(os.path.join(cwd, "ta.key"), "./ta.key")
+        archive.write(os.path.join(cwd, "client.crt"), "./client.crt")
+        archive.write(os.path.join(cwd, "client.csr"), "./client.csr")
+        archive.write(os.path.join(cwd, "client.key"), "./client.key")
+        archive.close()
+
+        return path
+
+def send_data(socket, data, encode=True):
+    if encode: data = bytes(data, "utf-8")
+    length = struct.pack('>L', len(data))
+    socket.sendall(length + data)
+
+def recv_data(socket, decode=True):
+    length = struct.unpack('>L', socket.recv(4))[0]
+    data = []
+    while length > 0:
+        buffer = socket.recv(min(length, BUFFER_SIZE))
+        length -= len(buffer)
+        data.append(buffer)
+    data_string = b"".join(data)
+    if decode: data_string = data_string.decode("utf-8")
+    return data_string
+
+class ServerHandler(BaseRequestHandler):
+    def handle(self):
+        data_string = recv_data(self.request, True)
+        reply = self.server.instance.handle(data_string, self.client_address)
+        send_data(self.request, reply, type(reply) != bytes)
+
+class Server(BaseRequestHandler):
+    def __init__(self, password, port, config_dir, init):
+        self.password = password or ""
+        self.port = port
+        self.config_dir = config_dir
+        self.generator = Generator(self.config_dir)
+        self.init = init
+
+    def run(self):
+        if self.init:
+            sys.stdout.flush()
+            self.generator.generate(True)
+        elif not os.path.exists(self.generator.get_key_dir("", True)):
+            print("Server certificate/key directory does not exist. Rerun with '--init' to create.")
+            sys.exit(1)
+
+        print("Running server on port {port} with password {password}.".format(port=self.port, password=self.password or "<no password>"))
+
+        self.generate_config()
+        self.run_openvpn()
+
+        self.listen()
+
+    def run_openvpn(self):
+        print("Starting OpenVPN server")
+        self.subprocess = subprocess.Popen(["openvpn", self.config_file])
+
+    def listen(self):
+        TCPServer.allow_reuse_address = True
+        self.server = TCPServer(("0.0.0.0", self.port), ServerHandler)
+        self.server.instance = self
+        self.server.serve_forever()
+
+    @property
+    def config_file_path(self):
+        return self.generator.get_key_dir("", True)
+
+    @property
+    def config_file(self):
+        return os.path.join(self.config_file_path, "server.conf")
+
+    def generate_config(self):
+        config = OPENVPN_SERVER_CONFIG.format(config_path=self.config_file_path)
+        with open(self.config_file, "w") as f:
+            f.write(config)
+        print("Saved configuration to %s" % self.config_file)
+
+    def __del__(self):
+        if "server" in self.__dict__ and self.server:
+            self.server.shutdown()
+            self.server.server_close()
+
+    def handle(self, data, client):
+        split = data.split("\n", 1)
+        cmd = split[0]
+        content = ""
+        if len(split) > 1:
+            content = split[1]
+
+        if cmd == "test-password":
+            return "1" if content == self.password else "0"
+        elif cmd == "generate":
+            if content != self.password:
+                return "error"
+            print("Generating user key for %s" % client[0])
+            key = self.generator.generate()
+            return read_file(self.generator.create_zip(key))
+
+        return "error"
+
+
+class Client(object):
+    def __init__(self, host, password, port, config_dir):
+        self.host = host
+        self.password = password or ""
+        self.port = port
+        self.config_dir = config_dir
+
+    def run(self):
+        # Info message
+        print("Client connecting to {host}:{port}".format(host=self.host, port=self.port))
+
+        # Test password
+        if self.test_password():
+            print("Connection successful, password ok!")
+        else:
+            print("Wrong password, try again!")
+            sys.exit(1)
+
+        # Request key
+        if not self.generate():
+            print("Connection/key generation failed :(")
+            sys.exit(1)
+
+        self.generate_config()
+
+        self.run_openvpn()
+
+    def run_openvpn(self):
+        print("My work here is done, starting OpenVPN client!")
+        print("=" * 79)
+
+        p = subprocess.Popen(["openvpn", self.config_file])
+        return p.wait()
+
+    def test_password(self):
+        return self.request("test-password\n%s" % self.password) == "1"
+
+    @property
+    def host_config_dir(self):
+        return os.path.join(os.path.abspath(os.path.expanduser(self.config_dir)), self.host)
+
+    def generate(self):
+        data = self.request("generate\n%s" % self.password, False)
+        if data == b"error": return False
+
+        fileData = io.BytesIO(data)
+        zipFile = zipfile.ZipFile(fileData)
+        zipFile.extractall(self.host_config_dir)
+        zipFile.close()
+        print("Saved key and certificate to %s/" % self.host_config_dir)
+        return True
+
+    @property
+    def config_file(self):
+        return os.path.join(self.host_config_dir, "client.conf")
+
+    def generate_config(self):
+        config = OPENVPN_CLIENT_CONFIG.format(host_config_dir=self.host_config_dir, host=self.host)
+        with open(self.config_file, "w") as f:
+            f.write(config)
+        print("Saved configuration to %s" % self.config_file)
+
+    def request(self, msg, decode_reply=True):
+        try:
+            self.socket = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
+            self.socket.connect((self.host, self.port))
+            send_data(self.socket, msg, True)
+            data = recv_data(self.socket, decode_reply)
+            self.socket.close()
+            return data
+        except ConnectionRefusedError as e:
+            print("Connection refused, is the server running?")
+            sys.exit(1)
+
+def run_client(args):
+    client = Client(**args)
+    client.run()
+    sys.exit(0)
+
+def run_server(args):
+    server = Server(**args)
+    server.run()
+    sys.exit(0)
+
+if __name__ == "__main__":
+    # create the top-level parser
+    parser = argparse.ArgumentParser(description='Create OpenVPN connections adhoc.')
+    subparsers = parser.add_subparsers()
+
+    # create the parser for the "foo" command
+    client_parser = subparsers.add_parser('client', formatter_class=argparse.ArgumentDefaultsHelpFormatter)
+    client_parser.add_argument('host', help='The server host.')
+    client_parser.add_argument('--password', help='The server password required for connection.')
+    client_parser.add_argument('--config-dir', metavar="DIR", default="~/.config/adhoc-openvpn/", help='A directory to store all configuration, certificates and keys.')
+    client_parser.add_argument('--port', default=DEFAULT_PORT, type=int, help='The port the server listens on.')
+    client_parser.set_defaults(func=run_client)
+
+    # create the parser for the "bar" command
+    server_parser = subparsers.add_parser('server')
+    server_parser.add_argument('--init', help='Create the server key/certificate in the config directory.', action='store_true')
+    server_parser.add_argument('--password', help='The password clients need for connection. Leave empty for no password.')
+    server_parser.add_argument('--config-dir', metavar="DIR", default="/tmp/adhoc-openvpn/", help='The directory to store all configuration, certificates and keys.')
+    server_parser.add_argument('--port', default=DEFAULT_PORT, type=int, help='The port to listen on')
+    server_parser.set_defaults(func=run_server)
+
+    # parse the args and call whatever function was selected
+    args = parser.parse_args()
+    if not "func" in args: parser.print_usage()
+    else: args.func({k:v for k, v in args.__dict__.items() if k != "func"})
